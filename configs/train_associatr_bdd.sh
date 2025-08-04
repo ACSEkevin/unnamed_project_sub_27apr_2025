@@ -1,0 +1,15 @@
+python main.py \
+    --device cpu \
+    --lr 1e-4 \
+    --lr_backbone 1e-5 \
+    --batch_size 2 \
+    --weight_decay 1e-4 \
+    --epochs 5 \
+    --lr_drop 100 \
+    --clip_max_norm 0.1 \
+    --pretrained ./weights/detr-r50-e632da11.pth \
+    --num_frames 4 \
+    --dataset_file bddmot20 \
+    --coco_path ./coco \
+    --img_folder /Users/kevin/datasets/BDD100kMOT20/images/ \
+    --output_dir ./checkpoints \
