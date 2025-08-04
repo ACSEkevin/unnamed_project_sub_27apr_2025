@@ -30,8 +30,10 @@ def get_args_parser():
                         help='gradient clipping max norm')
 
     # Model parameters
-    parser.add_argument('--pretrained', type=str, default=None,
-                        help="Path to the pretrained model.")
+    parser.add_argument('--pretrained', nargs="?", const=True, default=False,
+                        help="load partial weights from pretrained DETR model (transformer attention, box embed head etc.). \
+                            One can pass an url or a path to DETR state dictionary, or does not pass any following value, \
+                            in which case weights will be downloaded from hub.")
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
     # * Backbone
