@@ -89,7 +89,7 @@ class ConvertCocoPolysToMask(object):
         classes = [obj["category_id"] for obj in anno]
         classes = torch.tensor(classes, dtype=torch.int64)
 
-        track_ids = [obj["track_id"] for obj in anno if "track_id" in obj] # list[str]
+        track_ids = torch.tensor([int(obj["track_id"]) for obj in anno if "track_id" in obj]).long() # list[str]
 
         if self.return_masks:
             segmentations = [obj["segmentation"] for obj in anno]
@@ -106,9 +106,10 @@ class ConvertCocoPolysToMask(object):
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         classes = classes[keep]
-        if len(track_ids) > 0:
-            valid_indices = torch.arange(len(track_ids)).long()[keep].tolist()
-            track_ids = torch.tensor([int(track_ids[i]) for i in valid_indices]).long()
+        track_ids = track_ids[keep]
+        # if len(track_ids) > 0:
+        #     valid_indices = torch.arange(len(track_ids)).long()[keep].tolist()
+        #     track_ids = torch.tensor([int(track_ids[i]) for i in valid_indices]).long()
 
         if self.return_masks:
             masks = masks[keep]
