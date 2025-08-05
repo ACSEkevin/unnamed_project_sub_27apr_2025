@@ -133,7 +133,7 @@ def rescale_bboxes(out_bbox: torch.Tensor, size):
     return b
 
 
-def plot_results(pil_img, prob, boxes, cls_list: list = None, cls: str = None):
+def plot_results(pil_img, prob, boxes, cls_list: list = None, cls: str = None, output_path: str = None):
     plt.figure(figsize=(12, 8))
     plt.imshow(pil_img)
     ax = plt.gca()
@@ -158,6 +158,9 @@ def plot_results(pil_img, prob, boxes, cls_list: list = None, cls: str = None):
                 bbox=dict(facecolor='yellow', alpha=0.3))
     plt.axis('off')
     plt.show()
+
+    if output_path:
+        plt.savefig(output_path, dpi=200)
 
 
 def filter_predictions(outputs: dict[str, torch.Tensor], conf: float = .85):
@@ -493,7 +496,7 @@ def test_load_bdd100k():
     from torch.utils.data import DataLoader
     from models.associatr import build, init_from_pretrained_detr
     from torch.optim import AdamW
-    from models.matcher import build_clip_matcher
+    from util.misc import MOTMetrics
 
     args = get_args_parser().parse_args()
 
@@ -507,7 +510,7 @@ def test_load_bdd100k():
     path = f"coco/annotations/instances_{mode}2017.json"
 
     data = BDD100kMOT20SeqDataset(partial_images, path, num_frames=4, transforms=make_bdd100k_mot20_transform(mode))
-    evaluator = CocoEvaluator(data.coco, ["bbox"])
+    evaluator = MOTMetrics()
     dataloader = DataLoader(data, batch_size=2, shuffle=True, num_workers=1, collate_fn=bdd100k_mot20_collate_fn)
 
     print("dataloader len: ", len(dataloader))
@@ -522,18 +525,10 @@ def test_load_bdd100k():
 
             print(key, val.shape)
 
-        loss_dict = crit(outputs, targets)
-        print(loss_dict)
+        results = post["mot"](outputs, targets)
+        evaluator.update(results)
 
-        weight_dict = crit.weight_dict
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-
-        optim.zero_grad()
-        losses.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-        optim.step()
-
-        print("norm: ", norm)
+        evaluator.summarize()
 
         # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         # results = post["bbox"].forward(outputs, orig_target_sizes)
@@ -560,10 +555,23 @@ def test_load_bdd100k():
 
 
 def build_associatr():
-    from util.box_ops import box_cxcywh_to_xyxy
-    a = torch.randn([2, 2, 3, 4]).sigmoid()
+    import pandas as pd
+    import numpy as np
+    import motmetrics as mm
 
-    print(box_cxcywh_to_xyxy(a))
+    mets = mm.metrics.motchallenge_metrics
+    dfs = [pd.DataFrame(np.random.randn(len(mets)).reshape(1, -1), columns=mets) for _ in range(6)]
+    concat_df = pd.concat(dfs, ignore_index=True)
+
+    data = concat_df.to_numpy()
+    nums = data.shape[0]
+
+    reduced_data = data.sum(0, keepdims=True)
+    reduced_data[:, [0, 1, 2, 3, 4, -5, -4]] /= nums
+
+    print(pd.DataFrame(reduced_data, columns=mets))
+
+
 
 
 
@@ -582,5 +590,5 @@ if __name__ == "__main__":
     # vis.run()
 
     # test_build_bdd100k()
-    test_load_bdd100k()
-    # build_associatr()
+    # test_load_bdd100k()
+    build_associatr()
