@@ -106,7 +106,7 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
-    parser.add_argument('--save_freq', default=10, type=int)
+    parser.add_argument('--save_freq', default=1000, type=int)
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -133,7 +133,8 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     if args.pretrained:
-        model = init_from_pretrained_detr(model, args.pretrained, skip_mismatch=True)
+        detr_state_dict = None if isinstance(args.pretrained, bool) else args.pretrained
+        model = init_from_pretrained_detr(model, detr_state_dict, skip_mismatch=True)
     model.to(device)
 
     model_without_ddp = model
