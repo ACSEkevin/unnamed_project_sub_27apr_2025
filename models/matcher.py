@@ -197,7 +197,7 @@ class ClipHungarianMatcher(nn.Module):
                     )[..., None] # [N_q, N_obj, 1]
                 gious.append(giou)
 
-            gious = torch.cat(gious, dim=-1) # [N_q, N_obj, N_frames]
+            gious = -torch.cat(gious, dim=-1) # [N_q, N_obj, N_frames]
             gious[~mask] = 0.
             cost_box_giou = torch.div(gious.sum(-1), objness.sum(-1)[None]) * self.cost_giou # [N_q, N_obj]
 
