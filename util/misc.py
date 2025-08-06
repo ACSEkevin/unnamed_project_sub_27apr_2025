@@ -11,12 +11,14 @@ from collections import defaultdict, deque
 import datetime
 import pickle
 from packaging import version
-from typing import Optional, List, Iterable, Any, overload
+from pandas import DataFrame
+from typing import Optional, List, Iterable, Any, overload, Union
 
 import torch
 import torch.distributed as dist
 import motmetrics as mm
-from torch import Tensor
+import pandas as pd
+from torch import Tensor, device
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
@@ -253,22 +255,61 @@ class MOTMetrics:
         self.metrics = metrics if metrics else mm.metrics.motchallenge_metrics
         self._stats = None
 
-    def update(self, hypothesis_ids: Iterable, target_ids: Iterable, cost_matrix: Any):
-        self.acc.update(target_ids, hypothesis_ids, cost_matrix)
+    @overload
+    def update(self, processed_outputs: list[list[dict[str, Union[Tensor, list]]]]):...
+    @overload
+    def update(self, hypothesis_ids: Iterable, target_ids: Iterable, cost_matrix: Union[Tensor, Any]):...
+
+    def update(self, *args):
+        assert len(args) in [1, 3], "Unsupported number of arguments: {}".format(len(args))
+        if len(args) == 3:
+            self.acc.update(*args)
+        else:
+            self._stats: list[DataFrame] = []
+            for video in args[0]:
+                self.acc.reset()
+                for frame_info in video:
+                    self.acc.update(**frame_info)
+                self._stats.append(self.compute())
+
+    def compute(self):
+        mh = mm.metrics.create()
+
+        return mh.compute(self.acc, metrics=self.metrics) 
+    
+    def reduce(self, stats: Union[list[DataFrame], DataFrame], op: Union[str, List[str]] = "mean"):
+        if not self.metrics == mm.metrics.motchallenge_metrics:
+            raise NotImplementedError()
+        
+        if isinstance(stats, DataFrame):
+            return stats
+        
+        assert isinstance(stats, list), type(stats)
+        for stat in stats:
+            assert isinstance(stat, DataFrame), type(stat)
+
+        mean_indices = [0, 1, 2, 3, 4, -5, -4] # "idf1", "idp", "idr", "recall", "precision", "mota", "motp"
+        data = pd.concat(self._stats, ignore_index=True).to_numpy()
+        nums = data.shape[0]
+
+        data = data.sum(0, keepdims=True)
+        data[:, mean_indices] /= nums # reduce scoring metrics by averaging
+
+        return DataFrame(data, columns=self.metrics)        
 
     def summarize(self, formatters: Any = None, namemap: dict[str, str] = None):
-        mh = mm.metrics.create()
-        self._stats = mh.compute(self.acc, metrics=self.metrics)
-        _str_summary = self._stats
+        _str_summary = self.compute() if self._stats is None else self.reduce(self._stats)
 
         if self.metrics == mm.metrics.motchallenge_metrics or namemap:
-            formatters = mh.formatters if formatters is None else formatters
             namemap = mm.io.motchallenge_metric_names if namemap is None else namemap
             _str_summary = mm.io.render_summary(
-                self._stats, formatters=formatters, namemap=namemap
+                _str_summary, formatters=formatters, namemap=namemap
             )
 
-        print(_str_summary)
+        if is_main_process():
+            print(_str_summary)
+
+        return _str_summary
 
     def synchronize_between_processes(self):...
 
@@ -322,7 +363,7 @@ class NestedTensor(object):
         self.mask = mask
 
     def to(self, device):
-        # type: (Device) -> NestedTensor # noqa
+        # type: (device) -> NestedTensor # noqa
         cast_tensor = self.tensors.to(device)
         mask = self.mask
         if mask is not None:
