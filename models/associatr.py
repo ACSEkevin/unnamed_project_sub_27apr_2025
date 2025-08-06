@@ -20,7 +20,7 @@ from .transformer import build_st_transformer, SpatialTemporalTransformer
 
 class AssociaTR(nn.Module):
     """ This is the AssociaTR module that performs stqtic sequential object detections """
-    def __init__(self, num_frames: int, backbone: Joiner, transformer: SpatialTemporalTransformer, num_classes: int, num_queries: int, aux_loss: int = False):
+    def __init__(self, num_frames: int, backbone: Joiner, transformer: SpatialTemporalTransformer, num_classes: int, num_queries: int, aux_loss: bool = False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -300,16 +300,40 @@ class SetCriterion(nn.Module):
                     losses.update(l_dict)
 
         return losses
+    
+
+class _postprocess(nn.Module):
+    @torch.no_grad()
+    def forward(self):...
+    @torch.no_grad()
+    def _decode_output_boxes(self, boxes: Tensor):
+        """
+        decode / de-normalize cross-frame boxes of instances that are normalized by frame number.
+
+        Args:
+            -- boxes: shape: [B, N, Nf x 4], output by model, format must be cxcywh
+        """
+        assert boxes.ndim == 3, boxes.size()
+        assert boxes.size(2) % 4 == 0, boxes.size(2)
+
+        B, N, _ = boxes.size()
+        Nf = boxes.size(2) // 4
+        adder = torch.arange(Nf, dtype=boxes.dtype, device=boxes.device)
+        adder = adder.view(1, 1, Nf, 1).repeat(B, N, 1, 2).flatten(2) # [B, N, Nf * 2]
+        boxes[..., 0::2] *= Nf
+        boxes[..., 0::2] -= adder
+
+        return boxes
 
 
-class PostProcessForCOCODet(nn.Module):
+class PostProcessForCOCODet(_postprocess):
     """ This module converts the model's output into the format expected by the coco api"""
     @torch.no_grad()
     def forward(self, outputs: dict[str, Union[Tensor, list]], target_sizes: Tensor):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
-            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
+            target_sizes: tensor of dimension [batch_size x num_frames x 2] containing the size of each images of the batch
                           For evaluation, this must be the original image size (before any data augmentation)
                           For visualization, this should be the image size after data augment, but before padding
         """
@@ -319,7 +343,7 @@ class PostProcessForCOCODet(nn.Module):
         num_frames = out_objness.size(-1)
         B, N = out_logits.shape[:2]
         out_logits = out_logits.unsqueeze(1).repeat(1, num_frames, 1, 1) # [B, Nf, N, N_cls + 1]
-        out_bbox = out_bbox.view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
+        out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
         out_objness = out_objness.permute(0, 2, 1) # [B, Nf, N]
 
         assert len(out_logits) * num_frames == len(target_sizes), "{} vs. {}".format(out_logits.size(), target_sizes)
@@ -335,12 +359,13 @@ class PostProcessForCOCODet(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=2) # [B, Nf, 4]
         boxes = boxes * scale_fct.unsqueeze(2) # [B, Nf, N, 4]
 
+        #FIXME: filter no-obj boxes by out_objness
         results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores.flatten(0, 1), labels.flatten(0, 1), boxes.flatten(0, 1))]
 
         return results
     
 
-class PostProcessForMOT(nn.Module):
+class PostProcessForMOT(_postprocess):
     """ This module converts the model's output into the format expected by pymotmetrics API (CLEAR MOT)"""
     def __init__(self, instance_conf: float = 0.8, objness_conf: float = 0.6) -> None:
         super().__init__()
@@ -357,7 +382,7 @@ class PostProcessForMOT(nn.Module):
         B, N = out_logits.shape[:2]
         assert B * num_frames == len(targets), "BxNf: {} vs. num_targets: {}".format(B * num_frames, len(targets))
 
-        out_bbox = out_bbox.view(B, N, num_frames, 4)
+        out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4)
         prob = F.softmax(out_logits, -1)
         scores, _ = prob[..., :-1].max(-1) # [B, N]
         

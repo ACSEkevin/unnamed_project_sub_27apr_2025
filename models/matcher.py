@@ -113,7 +113,12 @@ class ClipHungarianMatcher(nn.Module):
                 for target_index, track_id in enumerate(target["track_ids"]):
                     mat_index = torch.where(mat[:, 0] == track_id)
                     mat[mat_index, 1] = target["labels"][target_index].float()
-                    mat[mat_index, 2 + frame_index * 4: 2 + (frame_index + 1) * 4] = target["boxes"][target_index]
+                    # note that boxes of a instance across frames are normalized (cx and w)
+                    # so that those cross-frame boxes are considered in one frame, which is benefit for prediction
+                    _box = target["boxes"][target_index].clone()
+                    _box[0::2] += frame_index
+                    _box[0::2] /= self.num_frames
+                    mat[mat_index, 2 + frame_index * 4: 2 + (frame_index + 1) * 4] = _box
                     mat[mat_index, 2 + self.num_frames * 4 + frame_index] = 1.
 
             mats.append(mat)
