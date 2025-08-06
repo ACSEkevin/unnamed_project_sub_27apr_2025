@@ -5,7 +5,7 @@ DETR model and criterion classes.
 import torch, warnings
 import torch.nn.functional as F
 from torch import nn, Tensor
-from typing import Union
+from typing import Union, Literal
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -132,7 +132,7 @@ class SetCriterion(nn.Module):
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits'] # [B, N, N_cls]
+        src_logits = outputs['pred_logits'] # [B, N, N_cls + 1]
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([mat[J, 1] for mat, (_, J) in zip(self.matcher.target_mats, indices)]).long()
@@ -349,8 +349,51 @@ class PostProcessForMOT(nn.Module):
         self.objness_conf = objness_conf
 
     @torch.no_grad()
-    def forward(self, outputs: dict[str, Union[Tensor, list]], target_sizes: Tensor):...
-    
+    def forward(self, outputs: dict[str, Union[Tensor, list]], targets: list[dict[Literal["labels", "boxes", "track_ids", "orig_size"], Tensor]]):
+        # [B, N, N_cls + 1], [B, N, Nf * 4], [B, N, Nf]
+        out_logits, out_bbox, out_objness = [outputs[key] for key in ["pred_logits", "pred_boxes", "pred_objness"]]
+
+        num_frames = out_objness.size(-1)
+        B, N = out_logits.shape[:2]
+        assert B * num_frames == len(targets), "BxNf: {} vs. num_targets: {}".format(B * num_frames, len(targets))
+
+        out_bbox = out_bbox.view(B, N, num_frames, 4)
+        prob = F.softmax(out_logits, -1)
+        scores, _ = prob[..., :-1].max(-1) # [B, N]
+        
+        videos: list[list[dict[str, Union[Tensor, list]]]] = [] # batch_list -> frame_list -> info_dict
+        for batch_index in range(B): # traverse number of videos
+            video_targets = targets[batch_index * num_frames: (batch_index + 1) * num_frames] # len == Nf
+            indices = torch.arange(N, dtype=torch.long, device=out_logits.device) # this is also used as track id
+            _cond1 = scores[batch_index] > self.instance_conf
+            per_frame_objness_keep = out_objness[batch_index] > self.objness_conf # [N, Nf]
+            _cond2 = per_frame_objness_keep.float().sum(-1) > 0 # [N]
+            per_video_keep = _cond1 & _cond2 # [N]
+
+            instance_indices = indices[per_video_keep] # [N_ins]
+            instance_boxes = out_bbox[batch_index][per_video_keep] # [N_ins, Nf, 4]
+            per_frame_objness_keep = per_frame_objness_keep[per_video_keep] # [N_ins, Nf]
+
+            frame_info: list[dict[str, Union[Tensor, list]]] = []
+            for frame_index in range(num_frames):
+                target = video_targets[frame_index]
+                oids = target["track_ids"].tolist()
+                oboxes = target["boxes"] # xyxy format
+
+                frame_keep = per_frame_objness_keep[:, frame_index] # [N_ins]
+                hids = instance_indices[frame_keep].tolist() # [N_ins_obj]
+                hboxes = instance_boxes[:, frame_index][frame_keep] # [N_ins_obj, 4] cxcywh format
+                hboxes = box_ops.box_cxcywh_to_xyxy(hboxes)
+                img_h, img_w = target["orig_size"] # [2]
+                hboxes = hboxes * torch.stack([img_w, img_h, img_w, img_h]).view(1, 4) # scale boxes to original sizes
+                frame_info.append(
+                    dict(hids=hids, oids=oids, dists=box_ops.box_iou(oboxes, hboxes)[0].cpu()) # note that cost mat are transposed as [N_oboxes, N_hboxes] for motmetrics api
+                )
+
+            videos.append(frame_info)
+
+        return videos
+
 
 def init_from_pretrained_detr(model: AssociaTR, detr_state_dict: Union[str, dict[str, Tensor]] = None, 
                                 load_backbone_state: bool = False, skip_mismatch: bool = False, verbose: bool = False):
@@ -450,8 +493,6 @@ def build(args):
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
                              eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)
-    postprocessors = {'bbox': PostProcessForCOCODet()}
-
-    # TODO: MOT postprocessor
+    postprocessors = {'bbox': PostProcessForCOCODet(), 'mot': PostProcessForMOT()}
 
     return model, criterion, postprocessors
