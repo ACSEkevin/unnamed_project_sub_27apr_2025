@@ -33,40 +33,6 @@ class HungarianMatcher(nn.Module):
         self.cost_giou = cost_giou
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
-        self.target_mats = None
-
-    def _construct_target_matrices(self, targets: list[dict[Literal["labels", "boxes", "track_ids"], Tensor]]):
-        mats: list[Tensor] = []
-        for batch_index in range(self.batch_size):
-            target_clip = targets[batch_index * self.num_frames: (batch_index + 1) * self.num_frames]
-            instances: Tensor = torch.cat([target["track_ids"] for target in target_clip]).unique()
-
-            mat = torch.zeros([len(instances), 1 + 1 + 4 * self.num_frames + self.num_frames], device=instances.device).float() # dim2: ids + cls + T * coords + T_objness
-            mat[:, 0] = instances.float()
-
-            for frame_index, target in enumerate(target_clip):
-                for target_index, track_id in enumerate(target["track_ids"]):
-                    mat_index = torch.where(mat[:, 0] == track_id)
-                    mat[mat_index, 1] = target["labels"][target_index].float()
-                    # note that boxes of a instance across frames are normalized (cx and w)
-                    # so that those cross-frame boxes are considered in one frame, which is benefit for prediction
-                    _box = target["boxes"][target_index].clone()
-                    _box[0::2] += frame_index
-                    _box[0::2] /= self.num_frames
-                    mat[mat_index, 2 + frame_index * 4: 2 + (frame_index + 1) * 4] = _box
-                    mat[mat_index, 2 + self.num_frames * 4 + frame_index] = 1.
-
-            mats.append(mat)
-
-        self.target_mats = mats
-
-        return mats
-    
-    def get_bs_numframes_(self, outputs: dict[Literal["pred_logits", "pred_boxes", "pred_objness"], Tensor]):
-        _shape = outputs["pred_objness"].size()
-        self.num_frames = _shape[-1]
-        self.batch_size = _shape[0]
-
     @torch.no_grad()
     def forward(self, outputs, targets):
         """ Performs the matching
@@ -88,8 +54,6 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
-        self.get_bs_numframes_(outputs)
-        self._construct_target_matrices(targets)
         bs, num_queries = outputs["pred_logits"].shape[:2] # [B, N, C]
 
         # We flatten to compute the cost matrices in a batch
@@ -210,7 +174,7 @@ class ClipHungarianMatcher(nn.Module):
             objness = mat[:, -self.num_frames:] # [N_obj, N_frames]
             # compute class cost
             probs = outputs["pred_logits"][batch_index].softmax(-1)
-            cost_cls = -probs[:, mat[:, 1].long()] # [N_q, N_obj]
+            cost_cls = -probs[:, mat[:, 1].long()] * self.cost_class # [N_q, N_obj]
 
             # compute boxes cost
             pred_boxes = outputs["pred_boxes"][batch_index] # [N_q, T * 4]
@@ -220,7 +184,7 @@ class ClipHungarianMatcher(nn.Module):
             cdists = (pred_boxes[:, None] - target_boxes[None]).abs().unflatten(-1, [-1, 4]).sum(-1)
             mask = objness.unsqueeze(0).repeat(cdists.size(0), 1, 1).bool()
             cdists[~mask] = 0. # distance where no obj set to 0.
-            cost_box_dist = torch.div(cdists.sum(-1), objness.sum(-1)[None]) # normalize cost by num of objness of each instance, [N_q, N_obj]
+            cost_box_dist = torch.div(cdists.sum(-1), objness.sum(-1)[None]) * self.cost_bbox # normalize cost by num of objness of each instance, [N_q, N_obj]
 
             ## compute giou
             gious = []
@@ -236,7 +200,7 @@ class ClipHungarianMatcher(nn.Module):
 
             gious = -torch.cat(gious, dim=-1) # [N_q, N_obj, N_frames]
             gious[~mask] = 0.
-            cost_box_giou = torch.div(gious.sum(-1), objness.sum(-1)[None]) # [N_q, N_obj]
+            cost_box_giou = torch.div(gious.sum(-1), objness.sum(-1)[None]) * self.cost_giou # [N_q, N_obj]
 
             # compute objectness cost
             cost_objness = 0.
@@ -244,9 +208,9 @@ class ClipHungarianMatcher(nn.Module):
                 pred_objness = outputs["pred_objness"][batch_index].sigmoid() # [N_q, N_frames]
                 cost_objness = -pred_objness[:, None] * objness[None] # [N_q, N_obj, N_frames]
                 cost_objness -= (1 - pred_objness)[:, None] * (1 - objness)[None]
-                cost_objness = cost_objness.sum(-1) # [N_q, N_obj]
+                cost_objness = cost_objness.sum(-1) * self.cost_objness # [N_q, N_obj]
 
-            batch_cost = cost_cls * self.cost_class + cost_box_dist * self.cost_bbox + cost_box_giou * self.cost_giou + cost_objness * self.cost_objness # [N_q, N_obj]
+            batch_cost = cost_cls + cost_box_dist + cost_box_giou + cost_objness # [N_q, N_obj]
             
             indices.append(linear_sum_assignment(batch_cost.cpu()))
 
