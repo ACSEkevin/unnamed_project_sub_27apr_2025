@@ -530,8 +530,14 @@ def build(args):
     if args.num_frames > 1:
         losses.insert(2, "objness")
 
-    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
-                             eos_coef=args.eos_coef, losses=losses)
+    if args.num_frames > 1:
+        criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
+                                eos_coef=args.eos_coef, losses=losses)
+    else:
+        from .detr import SetCriterion as DETRCrit
+        criterion = DETRCrit(num_classes, matcher=matcher, weight_dict=weight_dict,
+                                eos_coef=args.eos_coef, losses=losses)
+    
     criterion.to(device)
     postprocessors = {'bbox': PostProcessForCOCODet()}
     if args.num_frames > 1:
