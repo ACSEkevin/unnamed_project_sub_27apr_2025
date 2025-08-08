@@ -202,10 +202,12 @@ class ClipHungarianMatcher(nn.Module):
             cost_box_giou = torch.div(gious.sum(-1), objness.sum(-1)[None]) * self.cost_giou # [N_q, N_obj]
 
             # compute objectness cost
-            pred_objness = outputs["pred_objness"][batch_index].sigmoid() # [N_q, N_frames]
-            cost_objness = -pred_objness[:, None] * objness[None] # [N_q, N_obj, N_frames]
-            cost_objness -= (1 - pred_objness)[:, None] * (1 - objness)[None]
-            cost_objness = cost_objness.sum(-1) * self.cost_objness # [N_q, N_obj]
+            cost_objness = 0.
+            if self.num_frames > 1:
+                pred_objness = outputs["pred_objness"][batch_index].sigmoid() # [N_q, N_frames]
+                cost_objness = -pred_objness[:, None] * objness[None] # [N_q, N_obj, N_frames]
+                cost_objness -= (1 - pred_objness)[:, None] * (1 - objness)[None]
+                cost_objness = cost_objness.sum(-1) * self.cost_objness # [N_q, N_obj]
 
             batch_cost = cost_cls + cost_box_dist + cost_box_giou + cost_objness # [N_q, N_obj]
             
