@@ -4,4 +4,6 @@ from .associatr import build as build_associatr
 
 
 def build_model(args):
+    if args.meta_arch == "detr":
+        return build_detr(args)
     return build_associatr(args)
