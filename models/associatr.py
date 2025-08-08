@@ -13,7 +13,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized)
 
 from .backbone import build_backbone, Joiner
-from .matcher import build_clip_matcher, ClipHungarianMatcher
+from .matcher import build_clip_matcher, build_matcher, ClipHungarianMatcher
 from .segmentation import dice_loss, sigmoid_focal_loss
 from .transformer import build_st_transformer, SpatialTemporalTransformer
 
@@ -171,9 +171,13 @@ class SetCriterion(nn.Module):
 
         num_frames = self.matcher.num_frames
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx].view(-1, num_frames, 4).flatten(0, 1) # [N_obj * N_frames, 4]
+        box_keep = torch.cat(
+            [mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)],
+            dim=0
+        ).bool() # [N_obj, N_frames]
+        src_boxes = outputs['pred_boxes'][idx].view(-1, num_frames, 4)[box_keep] # [N_obj_tp, 4]
         target_boxes = torch.cat([mat[i, 2: 2 + 4 * num_frames] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, 4 * N_frames]
-        target_boxes = target_boxes.view(-1, num_frames, 4).flatten(0, 1) # [N_obj * N_frames, 4]
+        target_boxes = target_boxes.view(-1, num_frames, 4)[box_keep] # [N_obj_tp, 4]
 
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
@@ -181,8 +185,8 @@ class SetCriterion(nn.Module):
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
 
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / norm_term
-        losses['loss_giou'] = loss_giou.sum() / norm_term
+        losses['loss_bbox'] = loss_bbox.sum(-1).mean()
+        losses['loss_giou'] = loss_giou.mean()
 
         return losses
     
@@ -303,6 +307,11 @@ class SetCriterion(nn.Module):
     
 
 class _postprocess(nn.Module):
+    def __init__(self, instance_conf: float = 0.8, objness_conf: float = 0.6) -> None:
+        super().__init__()
+        self.instance_conf = instance_conf
+        self.objness_conf = objness_conf
+
     @torch.no_grad()
     def forward(self):...
     @torch.no_grad()
@@ -329,7 +338,7 @@ class _postprocess(nn.Module):
 class PostProcessForCOCODet(_postprocess):
     """ This module converts the model's output into the format expected by the coco api"""
     @torch.no_grad()
-    def forward(self, outputs: dict[str, Union[Tensor, list]], target_sizes: Tensor):
+    def forward(self, outputs: dict[str, Union[Tensor, list]], target_sizes: Tensor, exclude_negatives: bool = False):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
@@ -341,16 +350,12 @@ class PostProcessForCOCODet(_postprocess):
         out_logits, out_bbox, out_objness = [outputs[key] for key in ["pred_logits", "pred_boxes", "pred_objness"]]
 
         num_frames = out_objness.size(-1)
-        B, N = out_logits.shape[:2]
-        out_logits = out_logits.unsqueeze(1).repeat(1, num_frames, 1, 1) # [B, Nf, N, N_cls + 1]
+        exclude_negatives = exclude_negatives and num_frames > 1
+        B, N, Cp1 = out_logits.shape
         out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
-        out_objness = out_objness.permute(0, 2, 1) # [B, Nf, N]
 
         assert len(out_logits) * num_frames == len(target_sizes), "{} vs. {}".format(out_logits.size(), target_sizes)
         assert target_sizes.shape[1] == 2
-
-        prob = F.softmax(out_logits, -1)
-        scores, labels = prob[..., :-1].max(-1) # [B, Nf, N]
 
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
@@ -359,20 +364,28 @@ class PostProcessForCOCODet(_postprocess):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=2) # [B, Nf, 4]
         boxes = boxes * scale_fct.unsqueeze(2) # [B, Nf, N, 4]
 
-        #FIXME: filter no-obj boxes by out_objness
-        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores.flatten(0, 1), labels.flatten(0, 1), boxes.flatten(0, 1))]
+        prob = F.softmax(out_logits, -1) # [B, N, N_cls + 1]
+        if exclude_negatives:
+            out_objness = out_objness.permute(0, 2, 1) > self.objness_conf # [B, Nf, N]
+            scores, labels = prob.unsqueeze(1).repeat(1, num_frames, 1, 1).max(-1) # [B, Nf, N]
+            tp_keep = torch.ne(labels, Cp1 - 1) # [B, Nf, N]
+            total_keep = out_objness & tp_keep # [B, Nf, N]
+            results = [
+                {'scores': s[keep], 'labels': l[keep], 'boxes': b[keep]}
+                for s, l, b, keep in zip(scores.flatten(0, 1), labels.flatten(0, 1), boxes.flatten(0, 1), total_keep.flatten(0, 1))
+            ]
+        else:
+            scores, labels = prob.unsqueeze(1).repeat(1, num_frames, 1, 1)[..., :-1].max(-1) # [B, Nf, N]
+            results = [
+                {'scores': s, 'labels': l, 'boxes': b}
+                for s, l, b in zip(scores.flatten(0, 1), labels.flatten(0, 1), boxes.flatten(0, 1))
+            ]
 
         return results
     
 
 class PostProcessForMOT(_postprocess):
     """ This module converts the model's output into the format expected by pymotmetrics API (CLEAR MOT)"""
-    def __init__(self, instance_conf: float = 0.8, objness_conf: float = 0.6) -> None:
-        super().__init__()
-
-        self.instance_conf = instance_conf
-        self.objness_conf = objness_conf
-
     @torch.no_grad()
     def forward(self, outputs: dict[str, Union[Tensor, list]], targets: list[dict[Literal["labels", "boxes", "track_ids", "orig_size"], Tensor]]):
         # [B, N, N_cls + 1], [B, N, Nf * 4], [B, N, Nf]
@@ -513,11 +526,15 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'objness', 'cardinality']
+    losses = ['labels', 'boxes', 'cardinality']
+    if args.num_frames > 1:
+        losses.insert(2, "objness")
 
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
                              eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)
-    postprocessors = {'bbox': PostProcessForCOCODet(), 'mot': PostProcessForMOT()}
+    postprocessors = {'bbox': PostProcessForCOCODet()}
+    if args.num_frames > 1:
+        postprocessors.update({'mot': PostProcessForMOT()})
 
     return model, criterion, postprocessors
