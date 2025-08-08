@@ -30,7 +30,7 @@ def get_args_parser():
                         help='gradient clipping max norm')
 
     # Model parameters
-    parser.add_argument("meta_arch", type=str, default="associatr", choices=["associatr", "detr"])
+    parser.add_argument("--meta_arch", type=str, default="associatr", choices=["associatr", "detr"])
     parser.add_argument('--pretrained', nargs="?", const=True, default=False,
                         help="load partial weights from pretrained DETR model (transformer attention, box embed head etc.). \
                             One can pass an url or a path to DETR state dictionary, or does not pass any following value, \
