@@ -33,6 +33,8 @@ class HungarianMatcher(nn.Module):
         self.cost_giou = cost_giou
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
+        self.target_mats = None
+
     def _construct_target_matrices(self, targets: list[dict[Literal["labels", "boxes", "track_ids"], Tensor]]):
         mats: list[Tensor] = []
         for batch_index in range(self.batch_size):
@@ -59,6 +61,11 @@ class HungarianMatcher(nn.Module):
         self.target_mats = mats
 
         return mats
+    
+    def get_bs_numframes_(self, outputs: dict[Literal["pred_logits", "pred_boxes", "pred_objness"], Tensor]):
+        _shape = outputs["pred_objness"].size()
+        self.num_frames = _shape[-1]
+        self.batch_size = _shape[0]
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -81,6 +88,7 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
+        self.get_bs_numframes_(outputs)
         self._construct_target_matrices(targets)
         bs, num_queries = outputs["pred_logits"].shape[:2] # [B, N, C]
 
