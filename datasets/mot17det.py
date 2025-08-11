@@ -130,19 +130,21 @@ class MOT17DetectionCOCOBuilder(COCOBuilder):
             for index in indices:
                 # img_path = os.path.join(img_folder, img_name)
                 frame_id = index + 1
-                img_path = f"{img_folder}/{frame_id:06d}{seq_info['imExt']}"
+                img_name = f"{frame_id:06d}{seq_info['imExt']}"
+                img_path = f"{img_folder}/{img_name}"
                 dst_path = ""
                 if self.rebuild_coco_path:
+                    img_name = f"{seq_length + frame_id:06d}{seq_info['imExt']}"
                     dst_path = os.path.join(
                             self.rebuild_coco_path, 
                             f"{self.mode}2017", 
-                            f"{seq_length + frame_id:06d}{seq_info['imExt']}"
+                            img_name
                         )
                     shutil.copy2(img_path, dst_path)
                 
                 coco_labels["images"].append({
                     "id": seq_length + frame_id,
-                    "file_name": dst_path if dst_path else img_path,
+                    "file_name": img_name,
                     "video_name": v_name,
                     "height": seq_info["imHeight"],
                     "width": seq_info["imWidth"]
