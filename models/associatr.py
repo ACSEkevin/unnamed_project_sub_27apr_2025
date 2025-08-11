@@ -482,6 +482,7 @@ def init_from_pretrained_detr(model: AssociaTR, detr_state_dict: Union[str, dict
 
         if _param_name in ['bbox_embed.layers.2.weight', 'bbox_embed.layers.2.bias']:
             model_state_dict[_param_name] = torch.cat([detr_state_dict[_param_name]] * model.num_frames, dim=0)
+            continue
 
         _validate_and_cover(_param_name, _param_name)
 
