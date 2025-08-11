@@ -515,7 +515,7 @@ def build(args):
         aux_loss=args.aux_loss,
     )
 
-    matcher = build_clip_matcher(args) if args.num_frames > 1 else build_matcher(args)
+    matcher = build_clip_matcher(args)
     weight_dict = {'loss_ce': 1, 'loss_bbox': args.bbox_loss_coef, 'loss_objness': args.objness_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
 
@@ -529,14 +529,9 @@ def build(args):
     losses = ['labels', 'boxes', 'cardinality']
     if args.num_frames > 1:
         losses.insert(2, "objness")
-
-    if args.num_frames > 1:
-        criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
-                                eos_coef=args.eos_coef, losses=losses)
-    else:
-        from .detr import SetCriterion as DETRCrit
-        criterion = DETRCrit(num_classes, matcher=matcher, weight_dict=weight_dict,
-                                eos_coef=args.eos_coef, losses=losses)
+        
+    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
+                            eos_coef=args.eos_coef, losses=losses)
     
     criterion.to(device)
     postprocessors = {'bbox': PostProcessForCOCODet()}
