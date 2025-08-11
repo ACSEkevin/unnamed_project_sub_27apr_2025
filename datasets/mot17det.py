@@ -3,15 +3,19 @@ import numpy as np
 
 from pathlib import Path
 from PIL import Image
-from typing import Callable, Literal, Optional, Union, Any
+from typing import Callable, Literal, Any
 from torchvision.datasets import CocoDetection
 
 from .coco_builder import COCOBuilder
 from .coco import ConvertCocoPolysToMask
+from util.misc import nested_tensor_from_tensor_list
+
+import datasets.transforms as T
 
 
 
 class MOT17SeqDataset(CocoDetection):
+    _mot17_classes = ["person"]
     def __init__(self, img_folder: str, anno_file: str, num_frames: int = 4, transforms: Callable = None) -> None:
         super().__init__(img_folder, anno_file)
         self.num_frames = num_frames
@@ -169,4 +173,61 @@ class MOT17DetectionCOCOBuilder(COCOBuilder):
             # categories exist in skeleton, no need to load.
     
         return coco_labels
+    
+
+def make_mot17_transform(mode: Literal["train", "val"]):
+    normalize = T.MotCompose([
+        T.MotToTensor(),
+        T.MotNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    # scales = [480 - 32]
+
+    if mode == 'train':
+        color_transforms = []
+        scale_transforms = [
+            T.MotRandomHorizontalFlip(),
+            T.MotRandomResize(scales, max_size=1333),
+            normalize,
+        ]
+
+        return T.MotCompose(color_transforms + scale_transforms)
+
+    if mode == 'val':
+        return T.MotCompose([
+            T.MotRandomResize([800], max_size=1333),
+            normalize,
+        ])
+
+    raise ValueError(f'unknown {mode}')
+
+
+def mot17_collate_fn(batch: list[tuple[list, list[dict]]]):
+    batch_images, batch_targets = [], []
+    for imgs, targets in batch:
+        batch_images.extend(imgs)
+        batch_targets.extend(targets)
+
+    batch_images = nested_tensor_from_tensor_list(batch_images)
+
+    return batch_images, batch_targets
+
+
+def build(image_set: Literal["train", "val"], args):
+    root = Path(args.coco_path)
+    assert root.exists(), f'provided COCO path {root} does not exist'
+
+    mode = 'instances'
+    PATHS = {
+        "train": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
+        "val": (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
+    }
+
+    img_folder, ann_file = PATHS[image_set]
+    if args.img_folder:
+        img_folder = os.path.join(args.img_folder, image_set)
+    dataset = MOT17SeqDataset(img_folder, ann_file, args.num_frames, transforms=make_mot17_transform(image_set))
+
+    return dataset, mot17_collate_fn
 
