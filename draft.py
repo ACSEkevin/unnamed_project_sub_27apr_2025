@@ -412,21 +412,31 @@ def test_build_coco_mot17():
 
     for mode in ["train", "val"]:
         path = "/Users/kevin/datasets/MOT17Labels/"
-        to = "./coco"
+        to = "./coco_mot"
         builder = MOT17DetectionCOCOBuilder(path).build(to, "val")
         print(len(builder))
 
 
 def test_load_coco_mot17():
-    from datasets.mot17det import MOT17SeqDataset
+    from datasets.mot17det import MOT17SeqDataset, make_mot17_transform
 
-    folder = "./coco"
-    mode = "train"
+    folder = "./coco_mot"
+    mode = "train_mot"
     data = MOT17SeqDataset(os.path.join(folder, f"{mode}2017"), 
                            os.path.join(folder, "annotations", f"instances_{mode}2017.json"),
                            num_frames=4)
     
     print(len(data))
+
+    index = 166
+    print(len(data), len(data.valid_ids))
+    print(data[index][1])
+    imgs, targets = data[index] # [N], [N]
+
+    for index in range(len(imgs)):
+        plot_results(
+            imgs[index], 1., targets[index]["boxes"], cls_list=data._bdd_mot20_classes, cls=targets[index]["labels"]
+        )
 
 
 def test_build_coco_crowdhuman():
