@@ -1,9 +1,77 @@
 import os, json, shutil, configparser
 import numpy as np
 
-from typing import Literal
+from pathlib import Path
+from PIL import Image
+from typing import Callable, Literal, Optional, Union, Any
+from torchvision.datasets import CocoDetection
 
 from .coco_builder import COCOBuilder
+from .coco import ConvertCocoPolysToMask
+
+
+
+class MOT17SeqDataset(CocoDetection):
+    def __init__(self, img_folder: str, anno_file: str, num_frames: int = 4, transforms: Callable = None) -> None:
+        super().__init__(img_folder, anno_file)
+        self.num_frames = num_frames
+        self.video_to_img_ids, self.valid_ids = self._register_videos()
+        self.prepare = ConvertCocoPolysToMask(False)
+
+        self._trans = transforms
+
+    def __len__(self) -> int:
+        assert len(self.valid_ids) % self.num_frames == 0
+        return len(self.valid_ids) // self.num_frames
+    
+    def __getitem__(self, index: int):
+        frame_ids = self.valid_ids[index * self.num_frames: (index + 1) * self.num_frames]
+
+        imgs, targets = [], []
+        for frame_id in frame_ids:
+            img, target = self._load_single_frame(frame_id)
+            imgs.append(img)
+            targets.append(target)
+
+        if self._trans:
+            imgs, targets = self._trans(imgs, targets)
+
+        return imgs, targets
+
+    def _register_videos(self):
+        _valid_ids: list[int] = []
+        _videos: dict[str, list[int]] = {}
+
+        for img in self.coco.dataset['images']:
+            video_name = img["video_name"]
+
+            if video_name not in _videos:
+                _videos[video_name] = []
+            _videos[video_name].append(img["id"])
+
+        for video, ids in _videos.items():
+            residual = len(ids) % self.num_frames
+            if residual > 0:
+                ids = ids[:-residual]
+
+            _videos[video] = ids
+            _valid_ids.extend(ids)
+
+        return _videos, _valid_ids
+    
+    def _load_image(self, id: int) -> Image.Image: # override
+        file_name = self.coco.loadImgs(id)[0]["file_name"]
+        path = os.path.join(self.root, file_name)
+
+        return Image.open(path)
+    
+    def _load_single_frame(self, frame_id: int) -> tuple[Image.Image, dict[str, Any]]:
+        image = self._load_image(frame_id)
+
+        target = self._load_target(frame_id)
+        target = {'image_id': frame_id, 'annotations': target}
+
+        return self.prepare(image, target)
 
 
 class MOT17DetectionCOCOBuilder(COCOBuilder):
@@ -71,6 +139,7 @@ class MOT17DetectionCOCOBuilder(COCOBuilder):
                 coco_labels["images"].append({
                     "id": seq_length + frame_id,
                     "file_name": dst_path if dst_path else img_path,
+                    "video_name": v_name,
                     "height": seq_info["imHeight"],
                     "width": seq_info["imWidth"]
                 })
