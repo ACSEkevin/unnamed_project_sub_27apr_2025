@@ -406,35 +406,27 @@ class AttentionVisualizer:
       return res
 
 
-def test_match():
-    from models.matcher import HungarianMatcher
-
-    matcher = HungarianMatcher()
-    out = {}
-    out["pred_logits"] = torch.randn([4, 40, 10]) # [B, N, C]
-    out["pred_boxes"] = torch.clip(torch.randn([4, 40, 4]), 0.01, 1.)
-
-    size = [5, 16, 10, 8]
-    targets = [
-        dict(
-            labels=torch.randint(0, 10, [_s], dtype=torch.long),
-            boxes=torch.clip(torch.randn([_s, 4]), 0.01, 1.),
-        )
-        for _s in size
-    ]
-
-    indices = matcher.forward(out, targets)
-    for ind_a, ind_b in indices:
-        print(ind_a, ind_b)
-
 
 def test_build_coco_mot17():
     from datasets.mot17det import MOT17DetectionCOCOBuilder
 
-    path = "/Users/kevin/datasets/MOT17Labels/"
-    to = "./coco"
-    builder = MOT17DetectionCOCOBuilder(path).build(to).build(to, "val")
-    print(len(builder))
+    for mode in ["train", "val"]:
+        path = "/Users/kevin/datasets/MOT17Labels/"
+        to = "./coco"
+        builder = MOT17DetectionCOCOBuilder(path).build(to, "val")
+        print(len(builder))
+
+
+def test_load_coco_mot17():
+    from datasets.mot17det import MOT17SeqDataset
+
+    folder = "./coco"
+    mode = "train"
+    data = MOT17SeqDataset(os.path.join(folder, f"{mode}2017"), 
+                           os.path.join(folder, "annotations", f"instances_{mode}2017.json"),
+                           num_frames=4)
+    
+    print(len(data))
 
 
 def test_build_coco_crowdhuman():
@@ -498,10 +490,17 @@ def test_load_bdd100k():
     from torch.optim import AdamW
     from util.misc import MOTMetrics
 
+    from models.matcher import build_matcher, build_clip_matcher
+
     args = get_args_parser().parse_args()
+    num_frames = 1
+    args.num_frames = num_frames
 
     model, crit, post = build(args)
     model = init_from_pretrained_detr(model, "./weights/detr-r50-e632da11.pth", skip_mismatch=True)
+
+    matcher = build_matcher(args)
+    clip_matcher = build_clip_matcher(args)
 
     optim = AdamW(model.parameters(), lr=5e-5)
 
@@ -509,8 +508,8 @@ def test_load_bdd100k():
     partial_images = f"/Users/kevin/datasets/BDD100kMOT20/images/{mode}"
     path = f"coco/annotations/instances_{mode}2017.json"
 
-    data = BDD100kMOT20SeqDataset(partial_images, path, num_frames=4, transforms=make_bdd100k_mot20_transform(mode))
-    evaluator = MOTMetrics()
+    data = BDD100kMOT20SeqDataset(partial_images, path, num_frames=num_frames, transforms=make_bdd100k_mot20_transform(mode))
+    evaluator = CocoEvaluator(data.coco, ["bbox"])
     dataloader = DataLoader(data, batch_size=2, shuffle=True, num_workers=1, collate_fn=bdd100k_mot20_collate_fn)
 
     print("dataloader len: ", len(dataloader))
@@ -525,21 +524,34 @@ def test_load_bdd100k():
 
             print(key, val.shape)
 
-        results = post["mot"](outputs, targets)
-        evaluator.update(results)
+        matcher_res = matcher.forward(outputs, targets)
+        clip_matcher_res = clip_matcher.forward(outputs, targets)
 
+        print(matcher_res)
+        print(clip_matcher_res)
+
+        for _mres, _cmres in zip(matcher_res, clip_matcher_res):
+            print(torch.eq(_mres[0], _cmres[0]), torch.eq(_mres[1], _cmres[1]))
+
+        raise
+
+        optim.zero_grad()
+        loss_dict = crit(outputs, targets)
+        weight_dict = crit.weight_dict
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        print(loss_dict)
+        losses.backward()
+
+        optim.step()
+
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        results = post["bbox"].forward(outputs, orig_target_sizes)
+        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        evaluator.update(res)
+
+        evaluator.synchronize_between_processes()
+        evaluator.accumulate()
         evaluator.summarize()
-
-        # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
-        # results = post["bbox"].forward(outputs, orig_target_sizes)
-
-
-        # res = {target['image_id'].item(): output for target, output in zip(targets, results)}
-        # evaluator.update(res)
-
-        # evaluator.synchronize_between_processes()
-        # evaluator.accumulate()
-        # evaluator.summarize()
 
         break
 
@@ -555,40 +567,21 @@ def test_load_bdd100k():
 
 
 def build_associatr():
-    import pandas as pd
-    import numpy as np
-    import motmetrics as mm
 
-    mets = mm.metrics.motchallenge_metrics
-    dfs = [pd.DataFrame(np.random.randn(len(mets)).reshape(1, -1), columns=mets) for _ in range(6)]
-    concat_df = pd.concat(dfs, ignore_index=True)
+    a = torch.Tensor([4, 4, 6, 7, 7, 9, 2, 4, 3, 3, 6, 1])
+    print(a.unique())
 
-    data = concat_df.to_numpy()
-    nums = data.shape[0]
-
-    reduced_data = data.sum(0, keepdims=True)
-    reduced_data[:, [0, 1, 2, 3, 4, -5, -4]] /= nums
-
-    print(pd.DataFrame(reduced_data, columns=mets))
-
-
+    print(torch.sort(a))
 
 
 
 if __name__ == "__main__":
     # model = build_detr_model()
     # vis_out_embed_contributions(model)
-    # for name in os.listdir("./test_images"):
-    #     try:
-    #         im = Image.open(os.path.join("./test_images", name))
-    #         inference_single_image(model, im, conf=0.85)
-    #     except Exception as e:
-    #         print(e)
 
-
-    # vis = AttentionVisualizer(model, get_transforms())
-    # vis.run()
+    test_build_coco_mot17()
+    test_load_coco_mot17()
 
     # test_build_bdd100k()
     # test_load_bdd100k()
-    build_associatr()
+    # build_associatr()
