@@ -480,6 +480,9 @@ def init_from_pretrained_detr(model: AssociaTR, detr_state_dict: Union[str, dict
             unloaded_param_names.append(_param_name)
             continue
 
+        if _param_name in ['bbox_embed.layers.2.weight', 'bbox_embed.layers.2.bias']:
+            model_state_dict[_param_name] = torch.cat([detr_state_dict[_param_name]] * model.num_frames, dim=0)
+
         _validate_and_cover(_param_name, _param_name)
 
     model.load_state_dict(model_state_dict)
@@ -529,7 +532,7 @@ def build(args):
     losses = ['labels', 'boxes', 'cardinality']
     if args.num_frames > 1:
         losses.insert(2, "objness")
-        
+
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
                             eos_coef=args.eos_coef, losses=losses)
     
