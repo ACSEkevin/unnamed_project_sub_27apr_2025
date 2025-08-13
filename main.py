@@ -62,6 +62,8 @@ def get_args_parser():
                         help="Number of query slots")
     parser.add_argument('--num_frames', default=4, type=int,
                         help="Number of frames when building an associator")
+    parser.add_argument('--enc_time_attn', default="none", type=str, choices=("joint", "div", "none"),
+                        help="Number of frames when building an associator")
     parser.add_argument('--pre_norm', action='store_true')
 
     # * Segmentation

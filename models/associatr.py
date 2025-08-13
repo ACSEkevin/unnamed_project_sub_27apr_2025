@@ -20,7 +20,7 @@ from .transformer import build_st_transformer, SpatialTemporalTransformer
 
 class AssociaTR(nn.Module):
     """ This is the AssociaTR module that performs stqtic sequential object detections """
-    def __init__(self, num_frames: int, backbone: Joiner, transformer: SpatialTemporalTransformer, num_classes: int, num_queries: int, aux_loss: bool = False):
+    def __init__(self, num_frames: int, backbone: Joiner, transformer: SpatialTemporalTransformer, num_classes: int, num_queries: int, enc_use_time_attn: str = "none", aux_loss: bool = False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -34,6 +34,7 @@ class AssociaTR(nn.Module):
         self.num_frames = num_frames
         self.num_queries = num_queries
         self.transformer = transformer
+        self.enc_use_time_attn = enc_use_time_attn
         hidden_dim = transformer.d_model
 
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
@@ -41,7 +42,10 @@ class AssociaTR(nn.Module):
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * num_frames, 3)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.time_pos_embed = nn.Embedding(1, self.num_frames)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        if not self.enc_use_time_attn == "none" and num_frames > 1:
+            self.input_proj = nn.Conv3d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
 
@@ -66,9 +70,14 @@ class AssociaTR(nn.Module):
         features, pos = self.backbone(samples)
 
         src, mask = features[-1].decompose() # [BxT, C, H, W], [BxT, H, W]
-        src = self.input_proj(src) # [BxT, D, H, W]
+        if not self.enc_use_time_attn == "none" and self.num_frames > 1:
+            src = src.unflatten(0, [-1, self.num_frames]).transpose(1, 2) # [B, D, T, H, W]
+            src = self.input_proj(src).transpose(1, 2).flatten(0, 1) # [BxT, D, H, W]
+        else:
+            src = self.input_proj(src) # [BxT, D, H, W]
+
         assert mask is not None
-        hs = self.transformer(src, mask, self.query_embed.weight, pos[-1])[0] # [B, N, D]
+        hs = self.transformer(src, mask, self.query_embed.weight, pos[-1], self.time_pos_embed.weight)[0] # [B, N, D]
 
         outputs_class = self.class_embed(hs) # [B, N, N_cls + 1]
         outputs_objness = self.objness_embed(hs) # [B, N, T]

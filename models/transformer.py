@@ -8,7 +8,7 @@ Copy-paste from torch.nn.Transformer with modifications:
     * decoder returns a stack of activations from all decoding layers
 """
 import copy
-from typing import Optional, List
+from typing import Optional, Literal, Callable
 
 import torch
 import torch.nn.functional as F
@@ -60,38 +60,76 @@ class Transformer(nn.Module):
     
 
 class SpatialTemporalTransformer(Transformer):
-    def __init__(self, num_frames: int, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, 
-                 dim_feedforward=2048, dropout=0.1, activation="relu", normalize_before=False, return_intermediate_dec=False):
+    def __init__(self, num_frames: int, enc_time_attn: Literal["joint", "div", "none"] = "none", d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, 
+                 dim_feedforward=2048, dropout=0.1, activation="relu", return_intermediate_dec=False):
         super().__init__(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, 
-                         dropout, activation, normalize_before, return_intermediate_dec)
+                         dropout, activation, False, return_intermediate_dec)
         self.num_frames = num_frames
+        self.enc_time_attn = enc_time_attn
 
-    def forward(self, src, mask, query_embed, pos_embed):
+        if enc_time_attn == "none" or num_frames <= 1:
+            encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, False)
+        else:
+            if enc_time_attn == "joint":
+                encoder_layer = JointSpaceTimeEncoderLayer(d_model, nhead, num_frames, dim_feedforward,
+                                                    dropout, activation, False)
+            elif enc_time_attn == "div":
+                encoder_layer = DividedSpaceTimeEncoderLayer(d_model, nhead, num_frames, dim_feedforward,
+                                                    dropout, activation, False)
+                
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers)
+
+    def _encoder_reshape_tensors(self, src: Tensor, mask: Tensor, query_embed: Tensor, pos_embed: Tensor, time_pos_embed: Tensor = None):
         # flatten NxCxHxW to HWxNxC
         bsxt, c, h, w = src.shape
         assert bsxt % self.num_frames == 0, "batch size: {}, num_frames: {}".format(bsxt, self.num_frames)
 
-        src = src.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
         query_embed = query_embed.unsqueeze(1).repeat(1, bsxt // self.num_frames, 1) # [N, B, D]
-        mask = mask.flatten(1) # [BxT, HW]
 
+        if self.enc_time_attn in ["none", "div"] or self.num_frames <= 1: # do not use temporal attn | divided attn
+            src = src.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
+            pos_embed = pos_embed.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
+            mask = mask.flatten(1) # [BxT, HW]
+            if self.enc_time_attn == "div": # [1, T] -> [T, BxHW, D]
+                time_pos_embed = time_pos_embed.unsqueeze(-1).repeat(bsxt // self.num_frames * h * w, 1, c).transpose(0, 1)
+        else: # joint sapce-time attn
+            _couple: Callable[[Tensor], Tensor] = lambda x: x.flatten(2).unflatten(0, [-1, self.num_frames]).permute(1, 3, 0, 2).flatten(0, 1) # [BxT, D, H, W] -> [TxHW, B, D]
+            src, pos_embed = _couple(src), _couple(pos_embed) # [TxHW, B, D]
+            mask = mask.unflatten(0, [-1, self.num_frames]).flatten(1) # [BxT, H, W] -> [B, TxHW]
+            if time_pos_embed is not None:  # [1, T] -> [HW, BxT, D]
+                time_pos_embed = time_pos_embed.unsqueeze(-1).repeat(h * w, bsxt // self.num_frames, c)
+                pos_embed += time_pos_embed
+
+        return src, mask, query_embed, pos_embed, time_pos_embed
+    
+    def _decoder_reshape_tensors(self, memory: Tensor, pos_embed: Tensor, mask: Tensor):
+        if self.enc_time_attn in ["none", "div"] or self.num_frames <= 1: # memory shape [HW, BxT, D]
+            _view: Callable[[Tensor], Tensor] = lambda x: x.unflatten(1, [-1, self.num_frames]).permute(2, 0, 1, 3).flatten(0, 1) # [HW, BxT, D] -> [TxHW, B, D]
+            mask = mask.unflatten(0, [-1, self.num_frames]).flatten(1)
+        else:
+            _view: Callable[[Tensor], Tensor] = lambda x: x
+
+        memory, pos_embed = _view(memory), _view(pos_embed)
+
+        return memory, pos_embed, mask
+
+    def forward(self, src: Tensor, mask: Tensor, query_embed: Tensor, pos_embed: Tensor, time_pos_embed: Tensor = None):
+        h, w = src.shape[-2:]
+        src, mask, query_embed, pos_embed, time_pos_embed = self._encoder_reshape_tensors(src, mask, query_embed, pos_embed, time_pos_embed)
         tgt = torch.zeros_like(query_embed)
-        memory: Tensor = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed) # [HW, BxT, D]
 
-         # [HW, BxT, D] -> [TxHW, B, D]
-        memory = memory.reshape(h * w, -1, self.num_frames, c).permute(2, 0, 1, 3).flatten(0, 1)
-        pos_embed = pos_embed.reshape(h * w, -1, self.num_frames, c).permute(2, 0, 1, 3).flatten(0, 1)
-        mask = mask.reshape(bsxt // self.num_frames, self.num_frames, h * w).flatten(1) # [B, TxHW]
+        memory: Tensor = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed, time_pos=time_pos_embed)
+
+        memory, pos_embed, mask = self._decoder_reshape_tensors(memory, pos_embed, mask) # [TxHW, B, D], ..., [B, TxHW]
 
         hs: Tensor = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed) # [N, B, D]
         
-        return hs.transpose(1, 2), memory.reshape(self.num_frames, h, w, -1, c).permute(3, 0, 4, 1, 2).flatten(0, 1) # -> [T, H, W, B, D] -> [B, T, D, H, W] -> [BxT, D, H, W]
+        return hs.transpose(1, 2), memory.unflatten(0, [self.num_frames, h, w]).permute(3, 0, 4, 1, 2).flatten(0, 1) # -> [T, H, W, B, D] -> [B, T, D, H, W] -> [BxT, D, H, W]
 
 
 class TransformerEncoder(nn.Module):
-
     def __init__(self, encoder_layer, num_layers, norm=None):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
@@ -101,12 +139,13 @@ class TransformerEncoder(nn.Module):
     def forward(self, src,
                 mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
+                pos: Optional[Tensor] = None,
+                time_pos: Tensor = None):
         output = src
 
         for layer in self.layers:
             output = layer(output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos)
+                           src_key_padding_mask=src_key_padding_mask, pos=pos, time_pos=time_pos)
 
         if self.norm is not None:
             output = self.norm(output)
@@ -209,7 +248,8 @@ class TransformerEncoderLayer(nn.Module):
     def forward(self, src,
                 src_mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
+                pos: Optional[Tensor] = None,
+                time_pos: Tensor = None) -> Tensor:
         if self.normalize_before:
             return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
@@ -298,6 +338,42 @@ class TransformerDecoderLayer(nn.Module):
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+    
+
+class JointSpaceTimeEncoderLayer(TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, num_frames: int, dim_feedforward=2048, dropout=0.1, activation="relu", normalize_before=False):
+        super().__init__(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
+        self.num_frames = num_frames
+    
+
+class DividedSpaceTimeEncoderLayer(TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, num_frames: int, dim_feedforward=2048, dropout=0.1, activation="relu", normalize_before=False):
+        super().__init__(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
+        self.num_frames = num_frames
+
+        self.time_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.time_dropout = nn.Dropout(dropout)
+        self.time_norm = nn.LayerNorm(d_model)
+
+    def forward(self, src: Tensor, src_mask: Tensor = None, src_key_padding_mask: Tensor = None, pos: Tensor = None, time_pos: Tensor = None):
+        hw = src.size(0)
+        q = k = self.with_pos_embed(src, pos)
+        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src) # [HW, BxT, D]
+
+        src = src.unflatten(1, [-1, self.num_frames]).permute(2, 1, 0, 3).flatten(1, 2) # [T, BxHW, D]
+        q = k = self.with_pos_embed(src, time_pos)
+        src2 = self.time_attn(q, k, value=src)[0]
+        src = src + self.time_dropout(src2)
+        src = self.time_norm(src) # [T, BxHW, D]
+        src = src.unflatten(1, [-1, hw]).permute(2, 1, 0, 3).flatten(1, 2) # [HW, BxT, D]
+
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src # [HW, BxT, D]
 
 
 def _get_clones(module, N):
@@ -319,13 +395,13 @@ def build_transformer(args):
 def build_st_transformer(args):
     return SpatialTemporalTransformer(
         num_frames=args.num_frames,
+        enc_time_attn=args.enc_time_attn,
         d_model=args.hidden_dim,
         dropout=args.dropout,
         nhead=args.nheads,
         dim_feedforward=args.dim_feedforward,
         num_encoder_layers=args.enc_layers,
         num_decoder_layers=args.dec_layers,
-        normalize_before=args.pre_norm,
         return_intermediate_dec=True,
     )
 
