@@ -91,14 +91,14 @@ class SpatialTemporalTransformer(Transformer):
             src = src.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
             pos_embed = pos_embed.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
             mask = mask.flatten(1) # [BxT, HW]
-            if self.enc_time_attn == "div": # [1, T] -> [T, BxHW, D]
-                time_pos_embed = time_pos_embed.unsqueeze(-1).repeat(bsxt // self.num_frames * h * w, 1, c).transpose(0, 1)
+            if self.enc_time_attn == "div": # [T, D] -> [T, BxHW, D]
+                time_pos_embed = time_pos_embed.unsqueeze(1).repeat(1, bsxt // self.num_frames * h * w, 1)
         else: # joint sapce-time attn
             _couple: Callable[[Tensor], Tensor] = lambda x: x.flatten(2).unflatten(0, [-1, self.num_frames]).permute(1, 3, 0, 2).flatten(0, 1) # [BxT, D, H, W] -> [TxHW, B, D]
             src, pos_embed = _couple(src), _couple(pos_embed) # [TxHW, B, D]
             mask = mask.unflatten(0, [-1, self.num_frames]).flatten(1) # [BxT, H, W] -> [B, TxHW]
-            if time_pos_embed is not None:  # [1, T] -> [TxHW, B, D]
-                time_pos_embed = time_pos_embed.unsqueeze(-1).unsqueeze(-1).repeat(h * w, 1, bsxt // self.num_frames, c).transpose(0, 1).flatten(0, 1)
+            if time_pos_embed is not None:  # [T, D] -> [TxHW, B, D]
+                time_pos_embed = time_pos_embed.unsqueeze(1).repeat(h * w, bsxt // self.num_frames, 1)
                 pos_embed += time_pos_embed
 
         return src, mask, query_embed, pos_embed, time_pos_embed

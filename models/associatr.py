@@ -42,7 +42,7 @@ class AssociaTR(nn.Module):
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * num_frames, 3)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.time_pos_embed = nn.Embedding(1, self.num_frames)
+        self.time_pos_embed = nn.Embedding(self.num_frames, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         if not self.enc_use_time_attn == "none" and num_frames > 1:
             self.input_proj = nn.Conv3d(backbone.num_channels, hidden_dim, kernel_size=1)
