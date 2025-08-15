@@ -92,7 +92,7 @@ class SpatialTemporalTransformer(Transformer):
             pos_embed = pos_embed.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
             mask = mask.flatten(1) # [BxT, HW]
             if self.enc_time_attn == "div": # [T, 1] -> [T, BxHW, D]
-                time_pos_embed = time_pos_embed.unsqueeze(-1).repeat(1, bsxt // self.num_frames * h * w, c)
+                time_pos_embed = time_pos_embed.unsqueeze(-1).unsqueeze(-1).repeat(1, bsxt // self.num_frames * h * w, c)
         else: # joint sapce-time attn
             _couple: Callable[[Tensor], Tensor] = lambda x: x.flatten(2).unflatten(0, [-1, self.num_frames]).permute(1, 3, 0, 2).flatten(0, 1) # [BxT, D, H, W] -> [TxHW, B, D]
             src, pos_embed = _couple(src), _couple(pos_embed) # [TxHW, B, D]
