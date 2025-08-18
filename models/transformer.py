@@ -60,12 +60,13 @@ class Transformer(nn.Module):
     
 
 class SpatialTemporalTransformer(Transformer):
-    def __init__(self, num_frames: int, enc_time_attn: Literal["joint", "div", "none"] = "none", d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, 
+    def __init__(self, num_frames: int, enc_time_attn: Literal["joint", "div", "none"] = "none", dec_time_attn: bool = False, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, 
                  dim_feedforward=2048, dropout=0.1, activation="relu", return_intermediate_dec=False):
         super().__init__(d_model, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, 
                          dropout, activation, False, return_intermediate_dec)
         self.num_frames = num_frames
         self.enc_time_attn = enc_time_attn
+        self.dec_time_attn = dec_time_attn
 
         if enc_time_attn == "none" or num_frames <= 1:
             encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
@@ -78,14 +79,21 @@ class SpatialTemporalTransformer(Transformer):
                 encoder_layer = DividedSpaceTimeEncoderLayer(d_model, nhead, num_frames, dim_feedforward,
                                                     dropout, activation, False)
                 
+        if dec_time_attn and num_frames > 1:
+            decoder_layer = SpaceTimeDecoderLayer(d_model, nhead, num_frames, dim_feedforward, dropout, activation)
+        else:
+            decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, False)
+        decoder_norm = nn.LayerNorm(d_model)
+                
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers)
+        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
+                                          return_intermediate=return_intermediate_dec)
 
-    def _encoder_reshape_tensors(self, src: Tensor, mask: Tensor, query_embed: Tensor, pos_embed: Tensor, time_pos_embed: Tensor = None):
+    def _encoder_reshape_tensors(self, src: Tensor, mask: Tensor, query_embed: Tensor, pos_embed: Tensor, time_pos_embed: Tensor = None, query_time_embed: Tensor = None):
         # flatten NxCxHxW to HWxNxC
         bsxt, c, h, w = src.shape
         assert bsxt % self.num_frames == 0, "batch size: {}, num_frames: {}".format(bsxt, self.num_frames)
-
-        query_embed = query_embed.unsqueeze(1).repeat(1, bsxt // self.num_frames, 1) # [N, B, D]
 
         if self.enc_time_attn in ["none", "div"] or self.num_frames <= 1: # do not use temporal attn | divided attn
             src = src.flatten(2).permute(2, 0, 1) # [HW, BxT, D]
@@ -101,32 +109,51 @@ class SpatialTemporalTransformer(Transformer):
                 time_pos_embed = time_pos_embed.unsqueeze(-1).repeat(h * w, bsxt // self.num_frames, c)
                 pos_embed += time_pos_embed
 
-        return src, mask, query_embed, pos_embed, time_pos_embed
+        query_embed = query_embed.unsqueeze(1).repeat(1, bsxt // self.num_frames, 1) # [N, B, D]
+        if self.dec_time_attn and self.num_frames > 1:
+            query_embed = query_embed.repeat(1, self.num_frames, 1) # [N, BxT, D]
+            # [T, 1] -> [T, BxN, D]
+            query_time_embed = query_time_embed.unsqueeze(-1).repeat(1, bsxt // self.num_frames * query_embed.size(0), c)
+
+        return src, mask, query_embed, pos_embed, time_pos_embed, query_time_embed
     
     def _decoder_reshape_tensors(self, memory: Tensor, pos_embed: Tensor, mask: Tensor):
+        _view: Callable[[Tensor], Tensor] = lambda x: x
         if self.enc_time_attn in ["none", "div"] or self.num_frames <= 1: # memory shape [HW, BxT, D]
-            _view: Callable[[Tensor], Tensor] = lambda x: x.unflatten(1, [-1, self.num_frames]).permute(2, 0, 1, 3).flatten(0, 1) # [HW, BxT, D] -> [TxHW, B, D]
-            mask = mask.unflatten(0, [-1, self.num_frames]).flatten(1)
-        else:
-            _view: Callable[[Tensor], Tensor] = lambda x: x
+            if not self.dec_time_attn:
+                _view = lambda x: x.unflatten(1, [-1, self.num_frames]).permute(2, 0, 1, 3).flatten(0, 1) # [HW, BxT, D] -> [TxHW, B, D]
+                mask = mask.unflatten(0, [-1, self.num_frames]).flatten(1) # [B, TxHW]
+        else: # joint space-time attn, memory shape: [TxHW, B, D]
+            if self.dec_time_attn:
+                _view = lambda x: x.unflatten(0, [self.num_frames, -1]).permute(1, 2, 0, 3).flatten(1, 2) # [HW, BxT, D]
+                mask = mask.unflatten(1, [self.num_frames, -1]).flatten(0, 1) # [BxT, HW]
 
         memory, pos_embed = _view(memory), _view(pos_embed)
 
         return memory, pos_embed, mask
+    
+    def _reshape_memory(self, memory: Tensor, fH: int, fW: int):
+        if self.dec_time_attn:
+            # [HW, BxT, D] -> [H, W, B, T, D] -> [B, T, D, H, W] -> [BxT, D, H, W]
+            return memory.view(fH, fW, -1, self.num_frames, memory.size(-1)).permute(2, 3, 4, 0, 1).flatten(0, 1)
+        else: 
+            # [TxHW, B, D] -> [T, H, W, B, D] -> [B, T, D, H, W] -> [BxT, D, H, W]
+            return memory.unflatten(0, [self.num_frames, fH, fW]).permute(3, 0, 4, 1, 2).flatten(0, 1)
 
-    def forward(self, src: Tensor, mask: Tensor, query_embed: Tensor, pos_embed: Tensor, time_pos_embed: Tensor = None):
+
+    def forward(self, src: Tensor, mask: Tensor, query_embed: Tensor, pos_embed: Tensor, time_pos_embed: Tensor = None, query_time_embed: Tensor = None):
         h, w = src.shape[-2:]
-        src, mask, query_embed, pos_embed, time_pos_embed = self._encoder_reshape_tensors(src, mask, query_embed, pos_embed, time_pos_embed)
+        src, mask, query_embed, pos_embed, time_pos_embed, query_time_embed = self._encoder_reshape_tensors(src, mask, query_embed, pos_embed, time_pos_embed, query_time_embed)
         tgt = torch.zeros_like(query_embed)
 
         memory: Tensor = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed, time_pos=time_pos_embed)
 
-        memory, pos_embed, mask = self._decoder_reshape_tensors(memory, pos_embed, mask) # [TxHW, B, D], ..., [B, TxHW]
+        memory, pos_embed, mask = self._decoder_reshape_tensors(memory, pos_embed, mask) # [TxHW, B, D] or [HW, BxT, D], ..., [B, TxHW]
 
         hs: Tensor = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed) # [N, B, D]
+                          pos=pos_embed, query_spatial_pos=query_embed, query_temporal_pos=query_time_embed) # [N, B, D] or [N, BxT, D]
         
-        return hs.transpose(1, 2), memory.unflatten(0, [self.num_frames, h, w]).permute(3, 0, 4, 1, 2).flatten(0, 1) # -> [T, H, W, B, D] -> [B, T, D, H, W] -> [BxT, D, H, W]
+        return hs.transpose(1, 2), self._reshape_memory(memory, h, w)
 
 
 class TransformerEncoder(nn.Module):
@@ -168,7 +195,7 @@ class TransformerDecoder(nn.Module):
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_spatial_pos: Tensor = None, query_temporal_pos: Tensor = None):
         output = tgt
 
         intermediate = []
@@ -178,7 +205,7 @@ class TransformerDecoder(nn.Module):
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
-                           pos=pos, query_pos=query_pos)
+                           pos=pos, query_spatial_pos=query_spatial_pos, query_temporal_pos=query_temporal_pos)
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
 
@@ -332,12 +359,12 @@ class TransformerDecoderLayer(nn.Module):
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_spatial_pos: Tensor = None, query_temporal_pos: Tensor = None):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
-                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_spatial_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_spatial_pos)
     
 
 class JointSpaceTimeEncoderLayer(TransformerEncoderLayer):
@@ -374,6 +401,48 @@ class DividedSpaceTimeEncoderLayer(TransformerEncoderLayer):
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         return src # [HW, BxT, D]
+    
+
+class SpaceTimeDecoderLayer(TransformerDecoderLayer):
+    def __init__(self, d_model: int, nhead: int, num_frames: int, dim_feedforward=2048, dropout=0.1, activation="relu"):
+        super().__init__(d_model, nhead, dim_feedforward, dropout, activation, False)
+
+        self.num_frames = num_frames
+
+        self.time_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.time_dropout = nn.Dropout(dropout)
+        self.time_norm = nn.LayerNorm(d_model)
+
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor = None, memory_mask: Tensor = None, 
+                tgt_key_padding_mask: Tensor = None, memory_key_padding_mask: Tensor = None, pos: Tensor = None, 
+                query_spatial_pos: Tensor = None, query_temporal_pos: Tensor = None):
+        # tgt shape: [N, BxT, D]
+        num_queries = tgt.size(0)
+        q = k = self.with_pos_embed(tgt, query_spatial_pos)
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_spatial_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        tgt = tgt.unflatten(1, [-1, self.num_frames]).permute(2, 1, 0, 3).flatten(1, 2) # [T, BxN, D]
+        q = k = self.with_pos_embed(tgt, query_temporal_pos)
+        tgt2 = self.time_attn(query=q, key=k, value=tgt)[0]
+        tgt = tgt + self.time_dropout(tgt2)
+        tgt = self.time_norm(tgt)
+        tgt = tgt.unflatten(1, [-1, num_queries]).transpose(1, 2).flatten(0, 1) # [TxN, B, D]
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+
+        return tgt.unflatten(0, [self.num_frames, -1]).permute(1, 2, 0, 3).flatten(1, 2) # [N, BxT, D]
 
 
 def _get_clones(module, N):
@@ -396,6 +465,7 @@ def build_st_transformer(args):
     return SpatialTemporalTransformer(
         num_frames=args.num_frames,
         enc_time_attn=args.enc_time_attn,
+        dec_time_attn=args.dec_time_attn,
         d_model=args.hidden_dim,
         dropout=args.dropout,
         nhead=args.nheads,
