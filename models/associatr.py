@@ -218,10 +218,12 @@ class SetCriterion(nn.Module):
         target_objness = torch.full_like(outputs["pred_objness"], 0., dtype=torch.float32, device=src_objness.device) # [B, N, T]
         target_objness_o = torch.cat([mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, N_frames]
         target_objness[idx] = target_objness_o
+        neg_weights = torch.full_like(target_objness, 1., dtype=torch.float32, device=src_objness.device)
+        neg_weights[neg_weights == 0.] = self.eos_coef
 
-        loss_objness = F.binary_cross_entropy_with_logits(src_objness, target_objness, reduction="sum") # [N_obj, N_frames]
+        loss_objness = F.binary_cross_entropy_with_logits(src_objness, target_objness, reduction="none") * neg_weights
 
-        return {"loss_objness": loss_objness / norm_term} # sum over frames, then normalized by number of instances
+        return {"loss_objness": loss_objness.sum(-1).mean()} # sum over frames, then normalized by number of instances
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the masks: the focal loss and the dice loss.
