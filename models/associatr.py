@@ -34,14 +34,16 @@ class AssociaTR(nn.Module):
         self.num_frames = num_frames
         self.num_queries = num_queries
         self.transformer = transformer
-        self.enc_use_time_attn = enc_use_time_attn
+        self.enc_use_time_attn = transformer.enc_time_attn
+        self.dec_use_time_attn = transformer.dec_time_attn
         hidden_dim = transformer.d_model
 
-        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
-        self.objness_embed = nn.Linear(hidden_dim, num_frames)
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * num_frames, 3)
+        self.class_embed = nn.Linear(hidden_dim if not self.dec_use_time_attn else hidden_dim * num_frames, num_classes + 1)
+        self.objness_embed = nn.Linear(hidden_dim, num_frames if not self.dec_use_time_attn else 1)
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * num_frames if not self.dec_use_time_attn else 4, 3)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_time_embed = nn.Embedding(self.num_frames, 1)
         self.time_pos_embed = nn.Embedding(self.num_frames, 1)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         if not self.enc_use_time_attn == "none" and num_frames > 1:
@@ -77,11 +79,17 @@ class AssociaTR(nn.Module):
             src = self.input_proj(src) # [BxT, D, H, W]
 
         assert mask is not None
-        hs = self.transformer(src, mask, self.query_embed.weight, pos[-1], self.time_pos_embed.weight)[0] # [B, N, D]
+        hs: Tensor = self.transformer(src, mask, self.query_embed.weight, pos[-1], 
+                                      self.time_pos_embed.weight, self.query_time_embed.weight)[0] # [N_dec, B, N, D] or [N_dec, BxT, N, D]
+        
+        outputs_class: Tensor = self.class_embed(hs if not self.dec_use_time_attn else hs.unflatten(1, [-1, self.num_frames]).transpose(2, 3).flatten(3)) # [N_dec, B, N, N_cls + 1]
+        outputs_objness: Tensor = self.objness_embed(hs) # [N_dec, B, N, T] or [N_dec, BxT, N, 1]
+        outputs_coord: Tensor = self.bbox_embed(hs).sigmoid() # [N_dec, B, N, Tx4] or [N_dec, BxT, N, 4]
 
-        outputs_class = self.class_embed(hs) # [B, N, N_cls + 1]
-        outputs_objness = self.objness_embed(hs) # [B, N, T]
-        outputs_coord = self.bbox_embed(hs).sigmoid() # [B, N, 4T]
+        if self.dec_use_time_attn:
+            outputs_objness = outputs_objness.squeeze().unflatten(1, [-1, self.num_frames]).transpose(2, 3) # [_, BxT, N, 1] -> [_, B, N, T]
+            outputs_coord = outputs_coord.unflatten(1, [-1, self.num_frames]).transpose(2, 3).flatten(3) # [_, BxT, N, 4] -> [_, B, N, Tx4]
+
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'pred_objness': outputs_objness[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_objness)
@@ -206,8 +214,10 @@ class SetCriterion(nn.Module):
         """
         num_frames = self.matcher.num_frames
         idx = self._get_src_permutation_idx(indices)
-        src_objness = outputs["pred_objness"][idx] # [N_obj, N_frames]
-        target_objness = torch.cat([mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, N_frames]
+        src_objness = outputs["pred_objness"] # [B, N, T]
+        target_objness = torch.full_like(outputs["pred_objness"], 0., dtype=torch.float32, device=src_objness.device) # [B, N, T]
+        target_objness_o = torch.cat([mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, N_frames]
+        target_objness[idx] = target_objness_o
 
         loss_objness = F.binary_cross_entropy_with_logits(src_objness, target_objness, reduction="sum") # [N_obj, N_frames]
 
@@ -489,7 +499,7 @@ def init_from_pretrained_detr(model: AssociaTR, detr_state_dict: Union[str, dict
             unloaded_param_names.append(_param_name)
             continue
 
-        if _param_name in ['bbox_embed.layers.2.weight', 'bbox_embed.layers.2.bias']:
+        if not model.dec_use_time_attn and _param_name in ['bbox_embed.layers.2.weight', 'bbox_embed.layers.2.bias']:
             model_state_dict[_param_name] = torch.cat([detr_state_dict[_param_name]] * model.num_frames, dim=0)
             continue
 
