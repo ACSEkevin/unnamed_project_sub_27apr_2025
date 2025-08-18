@@ -436,13 +436,13 @@ class SpaceTimeDecoderLayer(TransformerDecoderLayer):
         tgt2 = self.time_attn(query=q, key=k, value=tgt)[0]
         tgt = tgt + self.time_dropout(tgt2)
         tgt = self.time_norm(tgt)
-        tgt = tgt.unflatten(1, [-1, num_queries]).transpose(1, 2).flatten(0, 1) # [TxN, B, D]
+        tgt = tgt.unflatten(1, [-1, num_queries]).permute(2, 1, 0, 3).flatten(1, 2) # [N, BxT, D]
 
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
 
-        return tgt.unflatten(0, [self.num_frames, -1]).permute(1, 2, 0, 3).flatten(1, 2) # [N, BxT, D]
+        return tgt
 
 
 def _get_clones(module, N):
