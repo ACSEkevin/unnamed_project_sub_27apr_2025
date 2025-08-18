@@ -63,7 +63,9 @@ def get_args_parser():
     parser.add_argument('--num_frames', default=4, type=int,
                         help="Number of frames when building an associator")
     parser.add_argument('--enc_time_attn', default="none", type=str, choices=("joint", "div", "none"),
-                        help="Number of frames when building an associator")
+                        help="type of encoder attention")
+    parser.add_argument('--dec_time_attn', action='store_true',
+                        help="whether use temporal attention in decoder")
     parser.add_argument('--pre_norm', action='store_true')
 
     # * Segmentation
