@@ -373,7 +373,8 @@ class PostProcessForCOCODet(_postprocess):
         num_frames = out_objness.size(-1)
         exclude_negatives = exclude_negatives and num_frames > 1
         B, N, Cp1 = out_logits.shape
-        out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
+        # out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
+        out_bbox = out_bbox.view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
 
         assert len(out_logits) * num_frames == len(target_sizes), "{} vs. {}".format(out_logits.size(), target_sizes)
         assert target_sizes.shape[1] == 2
@@ -416,7 +417,8 @@ class PostProcessForMOT(_postprocess):
         B, N = out_logits.shape[:2]
         assert B * num_frames == len(targets), "BxNf: {} vs. num_targets: {}".format(B * num_frames, len(targets))
 
-        out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4)
+        # out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4)
+        out_bbox = out_bbox.view(B, N, num_frames, 4)
         prob = F.softmax(out_logits, -1)
         scores, _ = prob[..., :-1].max(-1) # [B, N]
         
