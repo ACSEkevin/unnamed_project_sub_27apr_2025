@@ -173,8 +173,15 @@ class ClipHungarianMatcher(nn.Module):
         for batch_index, mat in enumerate(mats):
             objness = mat[:, -self.num_frames:] # [N_obj, N_frames]
             # compute class cost
-            probs = outputs["pred_logits"][batch_index].softmax(-1)
-            cost_cls = -probs[:, mat[:, 1].long()] * self.cost_class # [N_q, N_obj]
+            probs = outputs["pred_logits"][batch_index].softmax(-1) # [N_q, T, N_cls + 1] or [N_q, N_cls + 1]
+            if probs.ndim == 2:
+                cost_cls = -probs[:, mat[:, 1].long()] * self.cost_class # [N_q, N_obj]
+            else:
+                assert probs.ndim == 3, probs.shape
+                t_labels = mat[:, 1].unsqueeze(0).repeat(self.num_frames, 1).long() # [T, N_obj]
+                t_labels[objness.mT == 0] = probs.size(-1) - 1 # background
+                cost_cls = -torch.stack([probs[:, i, t_labels[i]] for i in range(self.num_frames)], dim=1) # [N_q, T, N_obj]
+                cost_cls = cost_cls.sum(1) * self.cost_class
 
             # compute boxes cost
             pred_boxes = outputs["pred_boxes"][batch_index] # [N_q, T * 4]

@@ -38,7 +38,7 @@ class AssociaTR(nn.Module):
         self.dec_use_time_attn = transformer.dec_time_attn
         hidden_dim = transformer.d_model
 
-        self.class_embed = nn.Linear(hidden_dim if not self.dec_use_time_attn else hidden_dim * num_frames, num_classes + 1)
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.objness_embed = nn.Linear(hidden_dim, num_frames if not self.dec_use_time_attn else 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4 * num_frames if not self.dec_use_time_attn else 4, 3)
 
@@ -82,11 +82,12 @@ class AssociaTR(nn.Module):
         hs: Tensor = self.transformer(src, mask, self.query_embed.weight, pos[-1], 
                                       self.time_pos_embed.weight, self.query_time_embed.weight)[0] # [N_dec, B, N, D] or [N_dec, BxT, N, D]
         
-        outputs_class: Tensor = self.class_embed(hs if not self.dec_use_time_attn else hs.unflatten(1, [-1, self.num_frames]).transpose(2, 3).flatten(3)) # [N_dec, B, N, N_cls + 1]
+        outputs_class: Tensor = self.class_embed(hs) # [N_dec, B, N, N_cls + 1] or [N_dec, BxT, N, N_cls + 1]
         outputs_objness: Tensor = self.objness_embed(hs) # [N_dec, B, N, T] or [N_dec, BxT, N, 1]
         outputs_coord: Tensor = self.bbox_embed(hs).sigmoid() # [N_dec, B, N, Tx4] or [N_dec, BxT, N, 4]
 
         if self.dec_use_time_attn:
+            outputs_class = outputs_class.unflatten(1, [-1, self.num_frames]).transpose(2, 3) # [_, BxT, N, N_cls + 1] -> [_, B, N, T, (N_cls + 1)]
             outputs_objness = outputs_objness.squeeze().unflatten(1, [-1, self.num_frames]).transpose(2, 3) # [_, BxT, N, 1] -> [_, B, N, T]
             outputs_coord = outputs_coord.unflatten(1, [-1, self.num_frames]).transpose(2, 3).flatten(3) # [_, BxT, N, 4] -> [_, B, N, Tx4]
 
@@ -149,20 +150,44 @@ class SetCriterion(nn.Module):
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits'] # [B, N, N_cls + 1]
-
+        src_logits = outputs['pred_logits'] # [B, N, N_cls + 1] or [B, N, T, N_cls + 1]
+        logits_ndim = src_logits.ndim
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([mat[J, 1] for mat, (_, J) in zip(self.matcher.target_mats, indices)]).long()
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device) # [B, N]
-        target_classes[idx] = target_classes_o
+        target_classes_o = torch.cat([mat[J, 1] for mat, (_, J) in zip(self.matcher.target_mats, indices)]).long() # [BN_obj]
+
+        if src_logits.ndim == 3:
+            target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                        dtype=torch.int64, device=src_logits.device) # [B, N]
+            target_classes[idx] = target_classes_o
+        else:
+            assert src_logits.ndim == 4, src_logits.shape
+
+            target_classes_o = target_classes_o.unsqueeze(-1).repeat(1, self.matcher.num_frames) # [BN_obj, T]
+            target_objness = torch.cat(
+                [mat[i, -self.matcher.num_frames:]
+                for mat, (_, i) in zip(self.matcher.target_mats, indices)],
+                dim=0
+            ) # [BN_obj, T]
+            target_classes_o[target_objness == 0] = src_logits.size(-1) - 1
+
+            target_classes = torch.full(src_logits.shape[:3], self.num_classes,
+                                        dtype=torch.int64, device=src_logits.device) # [B, N, T]
+            target_classes[idx] = target_classes_o
+
+            src_logits = src_logits.flatten(1, 2) # [B, NxT, N_cls + 1]
+            target_classes = target_classes.flatten(1) # [B, NxT]
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {'loss_ce': loss_ce}
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
-            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+            if logits_ndim == 4:
+                src_logits = src_logits.unflatten(1, [-1, self.matcher.num_frames])[idx].flatten(0, 1)
+                target_classes_o = target_classes_o.flatten()
+                losses['class_error'] = 100 - accuracy(src_logits, target_classes_o)[0]
+            else:
+                losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
     @torch.no_grad()
@@ -170,9 +195,17 @@ class SetCriterion(nn.Module):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
-        pred_logits = outputs['pred_logits']
+        pred_logits = outputs['pred_logits'] # [B, N, N_cls + 1] or [B, N, T, N_cls + 1]
         device = pred_logits.device
-        tgt_lengths = torch.as_tensor([len(mat) for mat in self.matcher.target_mats], device=device)
+        if pred_logits.ndim == 4:
+            tgt_lengths = torch.cat(
+                [mat[i, -self.matcher.num_frames:].sum(0)
+                for mat, (_, i) in zip(self.matcher.target_mats, indices)],
+            ) # [BxT]
+            pred_logits = pred_logits.transpose(1, 2).flatten(0, 1) # [BxT, N, N_cls + 1]
+        else:
+            tgt_lengths = torch.as_tensor([len(mat) for mat in self.matcher.target_mats], device=device)
+
         # Count the number of predictions that are NOT "no-object" (which is the last class)
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
@@ -214,14 +247,19 @@ class SetCriterion(nn.Module):
         """
         num_frames = self.matcher.num_frames
         idx = self._get_src_permutation_idx(indices)
-        src_objness = outputs["pred_objness"] # [B, N, T]
-        target_objness = torch.full_like(outputs["pred_objness"], 0., dtype=torch.float32, device=src_objness.device) # [B, N, T]
-        target_objness_o = torch.cat([mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, N_frames]
-        target_objness[idx] = target_objness_o
-        neg_weights = torch.full_like(target_objness, 1., dtype=torch.float32, device=src_objness.device)
-        neg_weights[neg_weights == 0.] = self.eos_coef
+        # src_objness = outputs["pred_objness"] # [B, N, T]
+        # target_objness = torch.full_like(outputs["pred_objness"], 0., dtype=torch.float32, device=src_objness.device) # [B, N, T]
+        # target_objness_o = torch.cat([mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, N_frames]
+        # target_objness[idx] = target_objness_o
+        # weights = torch.full_like(target_objness, 1., dtype=torch.float32, device=src_objness.device)
+        # weights[target_objness == 0.] = self.eos_coef
 
-        loss_objness = F.binary_cross_entropy_with_logits(src_objness, target_objness, reduction="none") * neg_weights
+        src_objness = outputs["pred_objness"][idx] # [N_obj, N_frames]
+        target_objness = torch.cat([mat[i, -num_frames:] for mat, (_, i) in zip(self.matcher.target_mats, indices)], dim=0) # [N_obj, N_frames]
+        weights = torch.full_like(target_objness, 1., dtype=torch.float32, device=src_objness.device)
+        weights[target_objness == 1.] = 0.7
+
+        loss_objness = F.binary_cross_entropy_with_logits(src_objness, target_objness, reduction="none") * weights
 
         return {"loss_objness": loss_objness.sum(-1).mean()} # sum over frames, then normalized by number of instances
 
@@ -367,12 +405,13 @@ class PostProcessForCOCODet(_postprocess):
                           For evaluation, this must be the original image size (before any data augmentation)
                           For visualization, this should be the image size after data augment, but before padding
         """
-        # [B, N, N_cls + 1], [B, N, Nf * 4], [B, N, Nf]
+        # [B, N, N_cls + 1] or [B, N, T, N_cls + 1], [B, N, Nf * 4], [B, N, Nf]
         out_logits, out_bbox, out_objness = [outputs[key] for key in ["pred_logits", "pred_boxes", "pred_objness"]]
 
         num_frames = out_objness.size(-1)
         exclude_negatives = exclude_negatives and num_frames > 1
-        B, N, Cp1 = out_logits.shape
+        size = out_logits.shape
+        B, N, Cp1 = size[0], size[1], size[-1]
         # out_bbox = self._decode_output_boxes(out_bbox).view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
         out_bbox = out_bbox.view(B, N, num_frames, 4).permute(0, 2, 1, 3) # [B, Nf, N, 4]
 
@@ -386,10 +425,17 @@ class PostProcessForCOCODet(_postprocess):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=2) # [B, Nf, 4]
         boxes = boxes * scale_fct.unsqueeze(2) # [B, Nf, N, 4]
 
-        prob = F.softmax(out_logits, -1) # [B, N, N_cls + 1]
+        prob = F.softmax(out_logits, -1) # [B, N, N_cls + 1] or [B, N, T, N_cls + 1]
+        if prob.ndim == 3:
+                prob = prob.unsqueeze(1).repeat(1, num_frames, 1, 1) # [B, Nf, N, N_cls + 1]
+        else:
+            assert prob.ndim == 4, prob.shape
+            prob = prob.transpose(1, 2) # [B, T, N, N_cls + 1]
+        
+        scores, labels = prob[..., :-1].max(-1)
+
         if exclude_negatives:
             out_objness = out_objness.permute(0, 2, 1) > self.objness_conf # [B, Nf, N]
-            scores, labels = prob.unsqueeze(1).repeat(1, num_frames, 1, 1).max(-1) # [B, Nf, N]
             tp_keep = torch.ne(labels, Cp1 - 1) # [B, Nf, N]
             total_keep = out_objness & tp_keep # [B, Nf, N]
             results = [
@@ -397,7 +443,6 @@ class PostProcessForCOCODet(_postprocess):
                 for s, l, b, keep in zip(scores.flatten(0, 1), labels.flatten(0, 1), boxes.flatten(0, 1), total_keep.flatten(0, 1))
             ]
         else:
-            scores, labels = prob.unsqueeze(1).repeat(1, num_frames, 1, 1)[..., :-1].max(-1) # [B, Nf, N]
             results = [
                 {'scores': s, 'labels': l, 'boxes': b}
                 for s, l, b in zip(scores.flatten(0, 1), labels.flatten(0, 1), boxes.flatten(0, 1))
@@ -426,6 +471,7 @@ class PostProcessForMOT(_postprocess):
         for batch_index in range(B): # traverse number of videos
             video_targets = targets[batch_index * num_frames: (batch_index + 1) * num_frames] # len == Nf
             indices = torch.arange(N, dtype=torch.long, device=out_logits.device) # this is also used as track id
+            # FIXME: [B, N, T, N_cls + 1] is not considered
             _cond1 = scores[batch_index] > self.instance_conf
             per_frame_objness_keep = out_objness[batch_index] > self.objness_conf # [N, Nf]
             _cond2 = per_frame_objness_keep.float().sum(-1) > 0 # [N]
@@ -554,7 +600,7 @@ def build(args):
         weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality']
-    if args.num_frames > 1:
+    if not args.dec_time_attn and args.num_frames > 1:
         losses.insert(2, "objness")
 
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
