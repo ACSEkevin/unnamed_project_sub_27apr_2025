@@ -211,7 +211,7 @@ class ClipHungarianMatcher(nn.Module):
 
             # compute objectness cost
             cost_objness = 0.
-            if self.num_frames > 1:
+            if probs.ndim == 2 and self.num_frames > 1:
                 pred_objness = outputs["pred_objness"][batch_index].sigmoid() # [N_q, N_frames]
                 cost_objness = -pred_objness[:, None] * objness[None] # [N_q, N_obj, N_frames]
                 cost_objness -= (1 - pred_objness)[:, None] * (1 - objness)[None]
