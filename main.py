@@ -101,6 +101,9 @@ def get_args_parser():
     parser.add_argument("--img_folder", type=str, help="specifying dataset image folder")
     parser.add_argument('--remove_difficult', action='store_true')
 
+    parser.add_argument('--num_iters', default=2, type=int)
+    parser.add_argument('--val_max_frames', default=10, type=int)
+
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cpu',
@@ -199,9 +202,17 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_state_dict = checkpoint['lr_scheduler']
+            optim_state = checkpoint['optimizer']
+            for group in optim_state["param_groups"]:
+                group["lr"] = group["initial_lr"]
+            
+            print("optimizer state: ", optim_state["param_groups"])
+            optimizer.load_state_dict(optim_state)
+
+            lr_state_dict = checkpoint['lr_scheduler'].copy()
             lr_state_dict["step_size"] = args.lr_drop
+
+            print("lr scheduler state: ", lr_state_dict)
             lr_scheduler.load_state_dict(lr_state_dict)
             args.start_epoch = checkpoint['epoch'] + 1
 
