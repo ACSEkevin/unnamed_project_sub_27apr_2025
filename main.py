@@ -202,18 +202,21 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optim_state = checkpoint['optimizer']
-            for group in optim_state["param_groups"]:
-                group["lr"] = group["initial_lr"]
+            optim_state = checkpoint['optimizer'].copy()
+            lr_state = checkpoint['lr_scheduler'].copy()
+
+            if lr_state["step_size"] < args.lr_drop:
+                for group in optim_state["param_groups"]:
+                    group["lr"] = group["initial_lr"]
             
             print("optimizer state: ", optim_state["param_groups"])
             optimizer.load_state_dict(optim_state)
 
-            lr_state_dict = checkpoint['lr_scheduler'].copy()
-            lr_state_dict["step_size"] = args.lr_drop
+            
+            lr_state["step_size"] = args.lr_drop
 
-            print("lr scheduler state: ", lr_state_dict)
-            lr_scheduler.load_state_dict(lr_state_dict)
+            print("lr scheduler state: ", lr_state)
+            lr_scheduler.load_state_dict(lr_state)
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
